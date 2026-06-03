@@ -39,6 +39,7 @@ def auth_adapter(session_db):
 def _create_session_app(adapter: APIServerAdapter) -> web.Application:
     app = web.Application()
     app.router.add_get("/v1/capabilities", adapter._handle_capabilities)
+    app.router.add_post("/api/voice/turns/stream", adapter._handle_voice_turn_stream)
     app.router.add_get("/api/sessions", adapter._handle_list_sessions)
     app.router.add_post("/api/sessions", adapter._handle_create_session)
     app.router.add_get("/api/sessions/{session_id}", adapter._handle_get_session)
@@ -63,6 +64,8 @@ async def test_capabilities_advertises_session_control_surface(adapter):
     assert features["session_resources"] is True
     assert features["session_chat"] is True
     assert features["session_chat_streaming"] is True
+    assert features["native_voice_turn_streaming"] is True
+    assert features["native_voice_audio"] is False
     assert features["session_fork"] is True
     assert features["admin_config_rw"] is False
     assert features["memory_write_api"] is False
@@ -73,6 +76,77 @@ async def test_capabilities_advertises_session_control_surface(adapter):
         "method": "POST",
         "path": "/api/sessions/{session_id}/chat/stream",
     }
+    assert data["endpoints"]["voice_turn_stream"] == {
+        "method": "POST",
+        "path": "/api/voice/turns/stream",
+    }
+
+
+@pytest.mark.asyncio
+async def test_native_voice_turn_stream_uses_text_contract_and_voice_prompt(adapter, session_db):
+    session_id = session_db.create_session("voice-session", "api_server")
+    session_db.append_message(session_id, "user", "earlier voice turn")
+    session_db.append_message(session_id, "assistant", "earlier answer")
+    captured_kwargs = {}
+
+    async def fake_run(**kwargs):
+        captured_kwargs.update(kwargs)
+        kwargs["stream_delta_callback"]("Affirmative, ")
+        kwargs["stream_delta_callback"]("Tim.")
+        return {"final_response": "Affirmative, Tim.", "session_id": session_id}, {"total_tokens": 4}
+
+    app = _create_session_app(adapter)
+    with patch.object(adapter, "_run_agent", side_effect=fake_run):
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/api/voice/turns/stream",
+                json={
+                    "session_id": session_id,
+                    "text": "Say hello.",
+                    "input_mode": "typed_stream",
+                    "synthesize_audio": False,
+                    "voice": {
+                        "assistant": "HAL",
+                        "spoken": True,
+                        "tts_friendly": True,
+                        "default_units": "imperial",
+                        "default_timezone": "America/Denver",
+                    },
+                    "metadata": {"channel": "web_voice"},
+                },
+            )
+            assert resp.status == 200, await resp.text()
+            assert resp.headers["Content-Type"].startswith("text/event-stream")
+            body = await resp.text()
+
+    assert captured_kwargs["user_message"] == "Say hello."
+    assert captured_kwargs["conversation_history"] == [
+        {"role": "user", "content": "earlier voice turn"},
+        {"role": "assistant", "content": "earlier answer"},
+    ]
+    assert captured_kwargs["session_id"] == session_id
+    prompt = captured_kwargs["ephemeral_system_prompt"]
+    assert "Hermes is HAL" in prompt
+    assert "voice playback" in prompt
+    assert "Imperial" in prompt
+    assert "America/Denver" in prompt
+    assert "event: voice.started" in body
+    assert "event: voice.text.delta" in body
+    assert "Affirmative, Tim." in body
+    assert "event: voice.text.completed" in body
+    assert "event: voice.completed" in body
+    assert '"audio": null' in body
+    assert "event: done" in body
+
+
+@pytest.mark.asyncio
+async def test_native_voice_turn_stream_rejects_blank_text(adapter):
+    app = _create_session_app(adapter)
+    async with TestClient(TestServer(app)) as cli:
+        resp = await cli.post("/api/voice/turns/stream", json={"session_id": "voice", "text": "   "})
+        assert resp.status == 400
+        payload = await resp.json()
+    assert payload["error"]["code"] == "missing_text"
 
 
 @pytest.mark.asyncio
