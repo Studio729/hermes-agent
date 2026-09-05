@@ -133,6 +133,10 @@ jobs:
           OPENROUTER_API_KEY: ""
           OPENAI_API_KEY: ""
           NOUS_API_KEY: ""
+          # The DIND runner reports the host CPU count. The test harness
+          # doubles that value by default, which overcommits the isolated job
+          # container and turns SQLite tests into timeout failures.
+          HERMES_TEST_WORKERS: "4"
         run: |
           source .venv/bin/activate
           python scripts/run_tests_parallel.py
