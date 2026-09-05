@@ -1,0 +1,33 @@
+name: Scheduled OSV scan
+
+on:
+  schedule:
+    - cron: "0 9 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  vulnerabilities:
+    name: OSV lockfile scan (advisory)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Scan pinned dependencies
+        run: |
+          set +e
+          osv-scanner scan \
+            --lockfile=uv.lock \
+            --lockfile=package-lock.json \
+            --lockfile=website/package-lock.json
+          status=$?
+          set -e
+          if [[ "$status" -eq 1 ]]; then
+            echo "OSV reported known vulnerabilities; detection is advisory."
+          elif [[ "$status" -ne 0 ]]; then
+            exit "$status"
+          fi

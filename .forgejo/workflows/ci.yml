@@ -1,0 +1,250 @@
+name: Forgejo CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: forgejo-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    name: Lint and static checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
+        with:
+          version: "0.11.6"
+      - name: Install linters
+        run: uv tool install ruff==0.15.10
+      - name: Ruff
+        run: ruff check .
+      - name: Lockfile consistency
+        run: uv lock --check
+      - name: Package build
+        run: uv build --sdist --wheel
+      - name: Shell scripts
+        run: shellcheck --severity=error docker/*.sh
+      - name: Windows footguns
+        run: python3 scripts/check-windows-footguns.py --all
+      - name: Validate Forgejo workflows
+        run: |
+          set -euo pipefail
+          for workflow in .forgejo/workflows/*.yml; do
+            forgejo-runner validate --workflow --path "$workflow"
+          done
+
+  pr-integrity:
+    name: PR history and supply-chain checks
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Reject disconnected history and critical supply-chain patterns
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          git merge-base "$BASE_SHA" "$HEAD_SHA" >/dev/null
+          diff_file="$(mktemp)"
+          trap 'rm -f "$diff_file"' EXIT
+          git diff "$BASE_SHA"..."$HEAD_SHA" -- . ':!uv.lock' ':!*.lock' ':!package-lock.json' >"$diff_file"
+          changed="$(git diff --name-only "$BASE_SHA"..."$HEAD_SHA")"
+          if printf '%s\n' "$changed" | grep -Eq '\.pth$|^(setup\.py|setup\.cfg|sitecustomize\.py|usercustomize\.py|__init__\.pth)$'; then
+            echo "critical install-hook file added or modified" >&2
+            exit 1
+          fi
+          if grep '^+' "$diff_file" | grep -iv '^+++' | grep -iE 'base64\.(b64decode|decodebytes|urlsafe_b64decode)' | grep -iEq 'exec\(|eval\('; then
+            echo "critical base64 decode plus exec/eval pattern detected" >&2
+            exit 1
+          fi
+          if grep '^+' "$diff_file" | grep -iv '^+++' | grep -E 'subprocess\.(Popen|call|run)\s*\(' | grep -iEq 'base64|\\x[0-9a-f]{2}|chr\('; then
+            echo "critical encoded subprocess pattern detected" >&2
+            exit 1
+          fi
+      - name: Check new dependency upper bounds
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          added="$(git diff "$BASE_SHA"..."$HEAD_SHA" -- pyproject.toml | grep '^+' | grep -v '^+++' || true)"
+          unbounded="$(printf '%s\n' "$added" | grep -oE '"[a-zA-Z0-9_-]+(\[[^]]*\])?>=[ 0-9.]+"' | grep -v ',<' || true)"
+          if [[ -n "$unbounded" ]]; then
+            printf 'unbounded PyPI dependencies:\n%s\n' "$unbounded" >&2
+            exit 1
+          fi
+      - name: Check contributor attribution
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          merge_base="$(git merge-base "$BASE_SHA" "$HEAD_SHA")"
+          missing=0
+          while IFS= read -r email; do
+            [[ -z "$email" ]] && continue
+            case "$email" in
+              *teknium*|*noreply@github.com*|*dependabot*|*github-actions*|*anthropic.com*|*cursor.com*) continue ;;
+            esac
+            [[ "$email" =~ \+.*@users\.noreply\.github\.com ]] && continue
+            if ! grep -qF "\"${email}\"" scripts/release.py; then
+              echo "unmapped contributor email: ${email}" >&2
+              missing=1
+            fi
+          done < <(git log "${merge_base}..${HEAD_SHA}" --format='%ae' --no-merges | sort -u)
+          [[ "$missing" -eq 0 ]]
+
+  tests:
+    name: Unit tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
+        with:
+          version: "0.11.6"
+      - name: Set up Python
+        run: uv python install 3.11
+      - name: Install dependencies
+        run: |
+          uv venv .venv --python 3.11
+          source .venv/bin/activate
+          uv pip install -e ".[all,dev]"
+      - name: Run isolated unit tests
+        env:
+          OPENROUTER_API_KEY: ""
+          OPENAI_API_KEY: ""
+          NOUS_API_KEY: ""
+        run: |
+          source .venv/bin/activate
+          python scripts/run_tests_parallel.py
+
+  e2e:
+    name: Packaged wheel and E2E
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
+        with:
+          version: "0.11.6"
+      - name: Set up Python
+        run: uv python install 3.11
+      - name: Install dependencies
+        run: |
+          uv venv .venv --python 3.11
+          source .venv/bin/activate
+          uv pip install -e ".[all,dev]"
+      - name: Run E2E suite
+        env:
+          OPENROUTER_API_KEY: ""
+          OPENAI_API_KEY: ""
+          NOUS_API_KEY: ""
+        run: |
+          source .venv/bin/activate
+          python -m pytest -m integration tests/test_wheel_locales_e2e.py -v
+          python -m pytest tests/e2e/ -v --tb=short
+
+  docs:
+    name: Documentation site
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: website/package-lock.json
+      - name: Install website dependencies
+        working-directory: website
+        run: npm ci
+      - name: Generate and build docs
+        run: |
+          python3 -m pip install --break-system-packages ascii-guard==2.3.0 pyyaml==6.0.3
+          python3 website/scripts/extract-skills.py
+          python3 website/scripts/generate-skill-docs.py
+          npm --prefix website run lint:diagrams
+          npm --prefix website run build
+
+  vulnerabilities:
+    name: OSV lockfile scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Scan pinned dependencies
+        run: |
+          set +e
+          osv-scanner scan \
+            --lockfile=uv.lock \
+            --lockfile=package-lock.json \
+            --lockfile=website/package-lock.json
+          status=$?
+          set -e
+          if [[ "$status" -eq 1 ]]; then
+            echo "OSV reported known vulnerabilities; detection is advisory."
+          elif [[ "$status" -ne 0 ]]; then
+            exit "$status"
+          fi
+
+  container:
+    name: Docker lint, build, and integration
+    needs: [quality, tests, e2e]
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Hadolint
+        run: >-
+          docker run --rm -i hadolint/hadolint@sha256:27086352fd5e1907ea2b934eb1023f217c5ae087992eb59fde121dce9c9ff21e
+          hadolint --failure-threshold warning
+          --ignore DL3008 --ignore DL3003 --ignore DL3059 --ignore DL3002
+          --trusted-registry docker.io --trusted-registry ghcr.io - <Dockerfile
+      - name: Build image
+        run: docker build --tag hermes-agent:forgejo-ci .
+      - name: Smoke image
+        uses: ./.github/actions/hermes-smoke-test
+        with:
+          image: hermes-agent:forgejo-ci
+      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
+        with:
+          version: "0.11.6"
+      - name: Run Docker integration tests
+        env:
+          HERMES_TEST_IMAGE: hermes-agent:forgejo-ci
+          OPENROUTER_API_KEY: ""
+          OPENAI_API_KEY: ""
+          NOUS_API_KEY: ""
+        run: |
+          uv python install 3.11
+          uv venv .venv --python 3.11
+          source .venv/bin/activate
+          uv pip install -e ".[dev]"
+          python -m pytest tests/docker/ -v --tb=short
