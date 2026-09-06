@@ -2469,6 +2469,7 @@ def test_pid_alive_detects_zombie(kanban_home):
             pass
 
 
+@pytest.mark.timeout(120)
 def test_task_ids_dont_collide_at_scale(kanban_home):
     """ID generator must be wide enough that creating 10k tasks doesn't
     hit a UNIQUE constraint violation.

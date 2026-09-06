@@ -101,6 +101,7 @@ jobs:
             HOME=/home/node \
             LANG=C.UTF-8 \
             PATH="$GITHUB_WORKSPACE/.venv/bin:/usr/local/bin:/usr/bin:/bin" \
+            TMPDIR=/tmp \
             TZ=UTC \
             VIRTUAL_ENV="$GITHUB_WORKSPACE/.venv" \
             XDG_RUNTIME_DIR=/run/user/1000 \

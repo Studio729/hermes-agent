@@ -31,6 +31,7 @@ Usage:
 Environment:
     HERMES_TEST_WORKERS  Override worker count (default: os.cpu_count())
     HERMES_TEST_PATHS    Override discovery roots (colon-sep, default: 'tests')
+    HERMES_TEST_DURATIONS_FILE  Override duration-cache path (default: <repo>/test_durations.json)
 
 Exit code: 0 if every file's pytest exited 0; 1 otherwise.
 """
@@ -497,6 +498,19 @@ def _print_inline_failure(
     print(flush=True)
 
 
+def _durations_path(repo_root: Path) -> Path:
+    """Return the duration-cache path.
+
+    ``HERMES_TEST_DURATIONS_FILE`` overrides the default repo-root cache
+    used by GitHub Actions. Forgejo's unprivileged job may not be able
+    to write that location; ``_save_durations`` falls back to ``$TMPDIR``.
+    """
+    override = os.environ.get("HERMES_TEST_DURATIONS_FILE")
+    if override:
+        return Path(override)
+    return repo_root / _DURATIONS_FILE
+
+
 def _load_durations(repo_root: Path) -> dict[str, float]:
     """Read the duration cache from the repo root.
 
@@ -504,7 +518,7 @@ def _load_durations(repo_root: Path) -> dict[str, float]:
     ``tests/tools/test_code_execution.py``) to wall-clock seconds from
     the last run. Missing or corrupt file → empty dict (safe fallback).
     """
-    path = repo_root / _DURATIONS_FILE
+    path = _durations_path(repo_root)
     if not path.is_file():
         return {}
     try:
@@ -516,20 +530,36 @@ def _load_durations(repo_root: Path) -> dict[str, float]:
 def _save_durations(
     file_times: List[Tuple[Path, float]],
     repo_root: Path,
-) -> None:
+) -> Path | None:
     """Write the duration cache so future ``--slice`` runs can use it.
 
     Merges with any existing cache so entries from files not in the
     current run (e.g. from a different slice) are preserved. Keys are
     repo-relative paths so the cache is portable across checkouts
-    and CI runners.
+    and CI runners. Returns the path written, or ``None`` if the
+    checkout (and ``$TMPDIR``) were not writable.
     """
     data: dict[str, float] = _load_durations(repo_root)
     for f, t in file_times:
         key = _format_file(f, repo_root)
         data[key] = round(t, 3)
-    path = repo_root / _DURATIONS_FILE
-    path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
+    payload = json.dumps(data, indent=2, sort_keys=True) + "\n"
+    candidates = [_durations_path(repo_root)]
+    seen = set(candidates)
+    for tmpdir in (os.environ.get("TMPDIR"), "/tmp"):
+        if not tmpdir:
+            continue
+        fallback = Path(tmpdir) / _DURATIONS_FILE
+        if fallback not in seen:
+            candidates.append(fallback)
+            seen.add(fallback)
+    for path in candidates:
+        try:
+            path.write_text(payload)
+            return path
+        except OSError:
+            continue
+    return None
 
 
 def _slice_files(
@@ -801,8 +831,11 @@ def main() -> int:
     # Locally, _save_durations merges with any existing cache so entries
     # from previous runs aren't lost.
     if file_times:
-        _save_durations(file_times, repo_root)
-        print(f"  Durations cached to {_DURATIONS_FILE} ({len(file_times)} files)")
+        saved = _save_durations(file_times, repo_root)
+        if saved is not None:
+            print(f"  Durations cached to {saved} ({len(file_times)} files)")
+        else:
+            print("  Durations cache skipped (read-only checkout)")
 
     # Per-file time distribution (throwaway diagnostic — shows how
     # subprocess time is distributed so we can see if startup dominates).

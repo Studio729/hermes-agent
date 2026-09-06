@@ -56,7 +56,25 @@ def _make_fake_ops(content="hello\n", total_lines=1, file_size=6):
 
 def _make_safe_tempdir(prefix: str) -> str:
     """Create a temp dir outside macOS system-sensitive /private/var paths."""
-    return tempfile.mkdtemp(prefix=prefix, dir=os.getcwd())
+    candidates = []
+    tmp = os.environ.get("TMPDIR") or tempfile.gettempdir()
+    if tmp and not tmp.startswith(("/var/", "/private/var/")):
+        candidates.append(tmp)
+    if os.access("/tmp", os.W_OK):
+        candidates.append("/tmp")
+    cwd = os.getcwd()
+    if os.access(cwd, os.W_OK):
+        candidates.append(cwd)
+    seen: set[str] = set()
+    for directory in candidates:
+        if directory in seen:
+            continue
+        seen.add(directory)
+        try:
+            return tempfile.mkdtemp(prefix=prefix, dir=directory)
+        except OSError:
+            continue
+    return tempfile.mkdtemp(prefix=prefix)
 
 
 # ---------------------------------------------------------------------------

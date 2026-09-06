@@ -36,7 +36,7 @@ prepare_checkout_dir() {
   local path
 
   case "$name" in
-    .pytest_cache | .uv-cache | .uv-python | .venv) ;;
+    .pytest_cache | .pytest-cache | .uv-cache | .uv-python | .venv) ;;
     *)
       echo "refusing unexpected checkout directory: $name" >&2
       return 1
@@ -71,6 +71,22 @@ prepare_checkout_dir() {
 }
 
 prepare_checkout_dir ".pytest_cache"
+prepare_checkout_dir ".pytest-cache"
 prepare_checkout_dir ".uv-cache"
 prepare_checkout_dir ".uv-python"
 prepare_checkout_dir ".venv"
+
+# Unprivileged tests create duration/temp files in the checkout root
+# (test_durations.json, hermes-*-tempdirs). Recursive chown would follow
+# checkout-controlled symlinks, so only the directory itself is made
+# sticky-writable. The test user can create new entries without deleting
+# root-owned files.
+chmod a+wt -- "$workspace"
+workspace_mode="$(stat -c '%A' -- "$workspace")"
+# %A is like drwxrwxrwt (or drwxrwsrwt when setgid). Other-write is
+# required so the test user can create files; sticky (t/T) so it cannot
+# unlink root-owned checkout entries.
+[[ "${workspace_mode:8:1}" == "w" && "${workspace_mode: -1}" == [tT] ]] || {
+  echo "workspace must be sticky-writable for unprivileged tests: $workspace ($workspace_mode)" >&2
+  exit 1
+}

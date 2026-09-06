@@ -74,6 +74,9 @@ def test_root_workspace_setup_replaces_symlinks_without_dereference() -> None:
     assert "chown -R" not in prep
     assert '[[ ! -L "$workspace" ]]' in prep
     assert 'chown --no-dereference "$owner:$group" -- "$workspace"' not in prep
+    assert 'chmod a+wt -- "$workspace"' in prep
+    assert "TMPDIR=/tmp" in unit_job
+    assert "TMPDIR" in UNPRIVILEGED_TESTS.read_text(encoding="utf-8")
     assert (
         "uv sync --frozen --extra all --extra dev --no-install-project" in install
     )
@@ -88,7 +91,13 @@ def test_root_workspace_setup_replaces_symlinks_without_dereference() -> None:
     chown_index = prep.index('chown --no-dereference "$owner:$group" -- "$path"')
     assert reset_index < absent_index < install_index < chown_index
 
-    for checkout_dir in (".pytest_cache", ".uv-cache", ".uv-python", ".venv"):
+    for checkout_dir in (
+        ".pytest_cache",
+        ".pytest-cache",
+        ".uv-cache",
+        ".uv-python",
+        ".venv",
+    ):
         assert f'prepare_checkout_dir "{checkout_dir}"' in prep
 
 

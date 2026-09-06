@@ -101,6 +101,12 @@ def _install_fake_tools_package():
     sys.modules["agent.auxiliary_client"] = types.SimpleNamespace(
         call_llm=lambda *args, **kwargs: "",
     )
+    # hermes_cli.auth imports this at module load. The fake agent package
+    # has an empty __path__, so the real submodule is unreachable unless
+    # we pre-install a stand-in (same pattern as browser_provider below).
+    sys.modules["agent.credential_persistence"] = types.SimpleNamespace(
+        sanitize_borrowed_credential_payload=lambda payload, provider_id=None: dict(payload),
+    )
 
     # Stubs for the browser-provider plugin layer introduced in PR #25214.
     # The fake `agent` package has an empty __path__ so real submodules
