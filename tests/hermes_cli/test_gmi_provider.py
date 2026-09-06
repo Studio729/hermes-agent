@@ -118,6 +118,13 @@ class TestGmiModelCatalog:
             },
         )
         monkeypatch.setattr("hermes_cli.models.fetch_api_models", lambda api_key, base_url: None)
+        # Profile-based live fetch is a second catalog path. Without this,
+        # a reachable network (Forgejo CI) returns the live /models list
+        # and this test never exercises the static fallback.
+        monkeypatch.setattr(
+            "providers.base.ProviderProfile.fetch_models",
+            lambda self, **kwargs: None,
+        )
 
         assert provider_model_ids("gmi") == list(_PROVIDER_MODELS["gmi"])
 
