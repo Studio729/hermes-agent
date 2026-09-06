@@ -418,10 +418,34 @@ class HonchoClientConfig:
             return cls.from_env(host=resolved_host)
 
         try:
-            raw = json.loads(path.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError) as e:
+            config_bytes = path.read_bytes()
+        except OSError as e:
             logger.warning("Failed to read %s: %s, falling back to env", path, e)
             return cls.from_env(host=resolved_host)
+
+        return cls.from_config_bytes(
+            config_bytes,
+            host=resolved_host,
+            config_path=path,
+        )
+
+    @classmethod
+    def from_config_bytes(
+        cls,
+        config_bytes: bytes,
+        *,
+        host: str,
+        config_path: Path | None = None,
+    ) -> HonchoClientConfig:
+        """Parse one immutable config snapshot for an already-resolved host."""
+        try:
+            raw = json.loads(config_bytes)
+        except (json.JSONDecodeError, UnicodeDecodeError) as e:
+            source = config_path or "Honcho config snapshot"
+            logger.warning("Failed to parse %s: %s, falling back to env", source, e)
+            return cls.from_env(host=host)
+
+        resolved_host = host
 
         host_block = _host_block(raw, resolved_host)
         # A hosts.hermes block or explicit enabled flag means the user

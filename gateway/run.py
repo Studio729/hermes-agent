@@ -26,6 +26,7 @@ except ModuleNotFoundError:
 
 import asyncio
 import dataclasses
+import hashlib
 import inspect
 import json
 import logging
@@ -15976,7 +15977,9 @@ class GatewayRunner:
         "honcho.runtime_peer_prefix",
         "honcho.user_peer_aliases",
     )
-    _HONCHO_CACHE_BUSTING_MEMO: dict[tuple[str, int | None], dict[str, Any]] = {}
+    _HONCHO_CACHE_BUSTING_MEMO: dict[
+        tuple[str, str, str | None], dict[str, Any]
+    ] = {}
 
     @classmethod
     def _empty_honcho_cache_busting_config(cls) -> dict[str, Any]:
@@ -15984,21 +15987,35 @@ class GatewayRunner:
 
     @classmethod
     def _extract_honcho_cache_busting_config(cls) -> dict[str, Any]:
-        """Extract Honcho identity keys, memoized by honcho.json mtime."""
+        """Extract Honcho identity keys, memoized by honcho.json content."""
         try:
-            from plugins.memory.honcho.client import HonchoClientConfig, resolve_config_path
+            from plugins.memory.honcho.client import (
+                HonchoClientConfig,
+                resolve_active_host,
+                resolve_config_path,
+            )
 
+            host = resolve_active_host()
             path = resolve_config_path()
             try:
-                mtime_ns = path.stat().st_mtime_ns
+                config_bytes = path.read_bytes()
+                content_digest = hashlib.sha256(config_bytes).hexdigest()
             except OSError:
-                mtime_ns = None
-            memo_key = (str(path), mtime_ns)
+                config_bytes = None
+                content_digest = None
+            memo_key = (str(path), host, content_digest)
             cached = cls._HONCHO_CACHE_BUSTING_MEMO.get(memo_key)
             if cached is not None:
                 return dict(cached)
 
-            hcfg = HonchoClientConfig.from_global_config(config_path=path)
+            if config_bytes is None:
+                hcfg = HonchoClientConfig.from_env(host=host)
+            else:
+                hcfg = HonchoClientConfig.from_config_bytes(
+                    config_bytes,
+                    host=host,
+                    config_path=path,
+                )
             aliases = hcfg.user_peer_aliases or {}
             values = {
                 "honcho.peer_name": hcfg.peer_name,

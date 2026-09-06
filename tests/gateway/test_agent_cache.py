@@ -340,13 +340,14 @@ class TestExtractCacheBustingConfig:
         assert sig_mem0["memory.provider"] == "mem0"
         assert sig_honcho != sig_mem0
 
-    def test_honcho_cache_busting_config_memoized_by_mtime(self, monkeypatch, tmp_path):
-        """Repeated Honcho extraction for unchanged honcho.json should reuse parse result."""
+    def test_honcho_cache_busting_config_memoized_by_content(self, monkeypatch, tmp_path):
+        """Unchanged bytes and host reuse the parsed Honcho identity values."""
         from types import SimpleNamespace
+
         from gateway.run import GatewayRunner
 
         config_path = tmp_path / "honcho.json"
-        config_path.write_text("{}")
+        config_path.write_bytes(b"{}")
         parse_calls = []
 
         class FakeConfig:
@@ -357,12 +358,13 @@ class TestExtractCacheBustingConfig:
             user_peer_aliases = {"123": "eri"}
 
             @classmethod
-            def from_global_config(cls, config_path=None):
-                parse_calls.append(config_path)
+            def from_config_bytes(cls, config_bytes, *, host, config_path=None):
+                parse_calls.append((config_bytes, host, config_path))
                 return cls()
 
         fake_client = SimpleNamespace(
             HonchoClientConfig=FakeConfig,
+            resolve_active_host=lambda: "hermes",
             resolve_config_path=lambda: config_path,
         )
         monkeypatch.setitem(__import__("sys").modules, "plugins.memory.honcho.client", fake_client)
@@ -373,13 +375,190 @@ class TestExtractCacheBustingConfig:
 
         assert first == second
         assert first["honcho.user_peer_aliases"] == [("123", "eri")]
-        assert parse_calls == [config_path]
+        assert parse_calls == [(b"{}", "hermes", config_path)]
 
-        config_path.write_text("{\n  \"changed\": true\n}")
+        changed_bytes = b'{\n  "changed": true\n}'
+        config_path.write_bytes(changed_bytes)
         third = GatewayRunner._extract_honcho_cache_busting_config()
 
         assert third == first
-        assert parse_calls == [config_path, config_path]
+        assert parse_calls == [
+            (b"{}", "hermes", config_path),
+            (changed_bytes, "hermes", config_path),
+        ]
+
+    def test_honcho_cache_busting_detects_same_mtime_same_size_edit(self, monkeypatch, tmp_path):
+        """Exact values and agent signature change despite restored metadata."""
+        import os
+
+        from gateway.run import GatewayRunner
+        from plugins.memory.honcho import client as honcho_client
+
+        content_a = b'{"peerName":"alice","aiPeer":"alpha","runtimePeerPrefix":"a_"}'
+        content_b = b'{"peerName":"bobby","aiPeer":"bravo","runtimePeerPrefix":"b_"}'
+        assert len(content_a) == len(content_b)
+
+        config_path = tmp_path / "honcho.json"
+        config_path.write_bytes(content_a)
+        original_stat = config_path.stat()
+        monkeypatch.setattr(honcho_client, "resolve_config_path", lambda: config_path)
+        monkeypatch.setattr(honcho_client, "resolve_active_host", lambda: "hermes")
+        monkeypatch.setattr(GatewayRunner, "_HONCHO_CACHE_BUSTING_MEMO", {})
+
+        values_a = GatewayRunner._extract_honcho_cache_busting_config()
+        config_path.write_bytes(content_b)
+        os.utime(config_path, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+        restored_stat = config_path.stat()
+        values_b = GatewayRunner._extract_honcho_cache_busting_config()
+
+        assert restored_stat.st_size == original_stat.st_size
+        assert restored_stat.st_mtime_ns == original_stat.st_mtime_ns
+        assert values_a == {
+            "honcho.peer_name": "alice",
+            "honcho.ai_peer": "alpha",
+            "honcho.pin_peer_name": False,
+            "honcho.runtime_peer_prefix": "a_",
+            "honcho.user_peer_aliases": [],
+        }
+        assert values_b == {
+            "honcho.peer_name": "bobby",
+            "honcho.ai_peer": "bravo",
+            "honcho.pin_peer_name": False,
+            "honcho.runtime_peer_prefix": "b_",
+            "honcho.user_peer_aliases": [],
+        }
+
+        runtime = {"api_key": "k", "base_url": "u", "provider": "p"}
+        signature_a = GatewayRunner._agent_config_signature(
+            "m", runtime, [], "", cache_keys=values_a
+        )
+        signature_b = GatewayRunner._agent_config_signature(
+            "m", runtime, [], "", cache_keys=values_b
+        )
+        assert signature_a != signature_b
+
+    def test_honcho_cache_busting_parses_the_exact_hashed_snapshot(self, monkeypatch, tmp_path):
+        """A post-read file swap cannot pair digest A with parsed values B."""
+        import os
+        from pathlib import Path
+
+        from gateway.run import GatewayRunner
+        from plugins.memory.honcho import client as honcho_client
+
+        content_a = b'{"peerName":"alice","aiPeer":"alpha","runtimePeerPrefix":"a_"}'
+        content_b = b'{"peerName":"bobby","aiPeer":"bravo","runtimePeerPrefix":"b_"}'
+        assert len(content_a) == len(content_b)
+
+        config_path = tmp_path / "honcho.json"
+        config_path.write_bytes(content_a)
+        original_stat = config_path.stat()
+        real_read_bytes = Path.read_bytes
+        swapped = False
+
+        def read_snapshot_then_swap(path):
+            nonlocal swapped
+            snapshot = real_read_bytes(path)
+            if path == config_path and not swapped:
+                swapped = True
+                config_path.write_bytes(content_b)
+                os.utime(
+                    config_path,
+                    ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns),
+                )
+            return snapshot
+
+        monkeypatch.setattr(Path, "read_bytes", read_snapshot_then_swap)
+        monkeypatch.setattr(honcho_client, "resolve_config_path", lambda: config_path)
+        monkeypatch.setattr(honcho_client, "resolve_active_host", lambda: "hermes")
+        monkeypatch.setattr(GatewayRunner, "_HONCHO_CACHE_BUSTING_MEMO", {})
+
+        first = GatewayRunner._extract_honcho_cache_busting_config()
+        assert swapped is True
+        assert real_read_bytes(config_path) == content_b
+
+        # Restore snapshot A with the same size and mtime. If the first parse
+        # reread B, its B values are now poisoned under A's digest and leak here.
+        config_path.write_bytes(content_a)
+        os.utime(
+            config_path,
+            ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns),
+        )
+        second = GatewayRunner._extract_honcho_cache_busting_config()
+
+        expected = {
+            "honcho.peer_name": "alice",
+            "honcho.ai_peer": "alpha",
+            "honcho.pin_peer_name": False,
+            "honcho.runtime_peer_prefix": "a_",
+            "honcho.user_peer_aliases": [],
+        }
+        assert first == expected
+        assert second == expected
+
+        runtime = {"api_key": "k", "base_url": "u", "provider": "p"}
+        assert GatewayRunner._agent_config_signature(
+            "m", runtime, [], "", cache_keys=first
+        ) == GatewayRunner._agent_config_signature(
+            "m", runtime, [], "", cache_keys=expected
+        )
+
+    def test_honcho_cache_busting_separates_active_hosts(self, monkeypatch, tmp_path):
+        """Same file bytes resolve and memoize independently for each host."""
+        import json
+
+        from gateway.run import GatewayRunner
+        from plugins.memory.honcho import client as honcho_client
+
+        config_path = tmp_path / "honcho.json"
+        config_path.write_text(
+            json.dumps(
+                {
+                    "hosts": {
+                        "hermes_alpha": {
+                            "peerName": "alice",
+                            "aiPeer": "agent-alpha",
+                            "runtimePeerPrefix": "a_",
+                        },
+                        "hermes_bravo": {
+                            "peerName": "bobby",
+                            "aiPeer": "agent-bravo",
+                            "runtimePeerPrefix": "b_",
+                        },
+                    }
+                }
+            )
+        )
+        active_hosts = iter(("hermes_alpha", "hermes_bravo"))
+        resolved_hosts = []
+
+        def resolve_active_host():
+            host = next(active_hosts)
+            resolved_hosts.append(host)
+            return host
+
+        monkeypatch.setattr(honcho_client, "resolve_config_path", lambda: config_path)
+        monkeypatch.setattr(honcho_client, "resolve_active_host", resolve_active_host)
+        monkeypatch.setattr(GatewayRunner, "_HONCHO_CACHE_BUSTING_MEMO", {})
+
+        alpha = GatewayRunner._extract_honcho_cache_busting_config()
+        bravo = GatewayRunner._extract_honcho_cache_busting_config()
+
+        assert resolved_hosts == ["hermes_alpha", "hermes_bravo"]
+        assert alpha["honcho.peer_name"] == "alice"
+        assert alpha["honcho.ai_peer"] == "agent-alpha"
+        assert alpha["honcho.runtime_peer_prefix"] == "a_"
+        assert bravo["honcho.peer_name"] == "bobby"
+        assert bravo["honcho.ai_peer"] == "agent-bravo"
+        assert bravo["honcho.runtime_peer_prefix"] == "b_"
+
+        runtime = {"api_key": "k", "base_url": "u", "provider": "p"}
+        alpha_signature = GatewayRunner._agent_config_signature(
+            "m", runtime, [], "", cache_keys=alpha
+        )
+        bravo_signature = GatewayRunner._agent_config_signature(
+            "m", runtime, [], "", cache_keys=bravo
+        )
+        assert alpha_signature != bravo_signature
 
     def test_full_round_trip_busts_cache_on_real_edit(self):
         """End-to-end: simulate a config edit on main and verify the
