@@ -79,7 +79,8 @@ def test_root_workspace_setup_replaces_symlinks_without_dereference() -> None:
     assert "TMPDIR" in UNPRIVILEGED_TESTS.read_text(encoding="utf-8")
     assert "PYTEST_ADDOPTS" in unit_job
     assert "--timeout=90" in unit_job
-    assert "--timeout-func-only" in unit_job
+    assert "-o timeout_func_only=true" in unit_job
+    assert "--timeout-func-only" not in unit_job
     assert "PYTEST_ADDOPTS" in UNPRIVILEGED_TESTS.read_text(encoding="utf-8")
     assert (
         "uv sync --frozen --extra all --extra dev --no-install-project" in install
