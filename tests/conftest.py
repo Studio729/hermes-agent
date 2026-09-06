@@ -358,6 +358,17 @@ def _hermetic_environment(tmp_path, monkeypatch):
     (fake_hermes_home / "memories").mkdir()
     (fake_hermes_home / "skills").mkdir()
     monkeypatch.setenv("HERMES_HOME", str(fake_hermes_home))
+    # SessionDB() defaults to hermes_state.DEFAULT_DB_PATH, which is computed
+    # at import time (often $HOME/.hermes/state.db). Four Forgejo workers
+    # sharing that file deadlock on WAL checkpoint and trip pytest-timeout.
+    try:
+        import hermes_state as _hermes_state
+
+        monkeypatch.setattr(
+            _hermes_state, "DEFAULT_DB_PATH", fake_hermes_home / "state.db"
+        )
+    except Exception:
+        pass
 
     # 4. Deterministic locale / timezone / hashseed. CI runs in UTC with
     #    C.UTF-8 locale; local dev often doesn't. Pin everything.

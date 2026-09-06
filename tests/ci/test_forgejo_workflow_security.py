@@ -77,6 +77,10 @@ def test_root_workspace_setup_replaces_symlinks_without_dereference() -> None:
     assert 'chmod a+wt -- "$workspace"' in prep
     assert "TMPDIR=/tmp" in unit_job
     assert "TMPDIR" in UNPRIVILEGED_TESTS.read_text(encoding="utf-8")
+    assert "PYTEST_ADDOPTS" in unit_job
+    assert "--timeout=90" in unit_job
+    assert "--timeout-func-only" in unit_job
+    assert "PYTEST_ADDOPTS" in UNPRIVILEGED_TESTS.read_text(encoding="utf-8")
     assert (
         "uv sync --frozen --extra all --extra dev --no-install-project" in install
     )

@@ -101,6 +101,7 @@ jobs:
             HOME=/home/node \
             LANG=C.UTF-8 \
             PATH="$GITHUB_WORKSPACE/.venv/bin:/usr/local/bin:/usr/bin:/bin" \
+            PYTEST_ADDOPTS="--timeout=90 --timeout-func-only" \
             TMPDIR=/tmp \
             TZ=UTC \
             VIRTUAL_ENV="$GITHUB_WORKSPACE/.venv" \
